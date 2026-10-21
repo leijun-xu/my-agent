@@ -1,0 +1,23 @@
+- insert:
+    - id: mcp-flyworks
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: flyworks
+        transport: stdio
+        command: !!js process.env.FLYWORKS_PYTHON_PATH
+        args:
+          - !!js process.env.FLYWORKS_SERVER_PATH
+        cwd: !!js process.cwd()
+        env:
+          FLYWORKS_API_TOKEN: !!js process.env.FLYWORKS_API_TOKEN
+          FLYWORKS_API_BASE_URL: !!js process.env.FLYWORKS_API_BASE_URL
+          FLYWORKS_SOURCE_DIR: !!js process.env.FLYWORKS_SOURCE_DIR
+          FLYWORKS_MEDIA_DIR: !!js process.env.FLYWORKS_MEDIA_DIR
+          FLYWORKS_OUTPUT_DIR: !!js process.env.FLYWORKS_OUTPUT_DIR
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10

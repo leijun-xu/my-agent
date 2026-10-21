@@ -1,0 +1,6 @@
+.DS_Store
+.env
+.dsh/
+.runtime/
+node_modules/
+*.log

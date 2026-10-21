@@ -1,0 +1,23 @@
+- insert:
+    - id: mcp-bocha
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: bocha
+        transport: stdio
+        command: !!js process.env.BOCHA_UV_PATH
+        args:
+          - --directory
+          - !!js process.env.BOCHA_MCP_DIR
+          - run
+          - --frozen
+          - bocha-search-mcp
+        cwd: !!js process.cwd()
+        env:
+          BOCHA_API_KEY: !!js process.env.BOCHA_API_KEY
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10

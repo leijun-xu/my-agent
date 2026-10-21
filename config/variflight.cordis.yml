@@ -1,0 +1,22 @@
+- insert:
+    - id: mcp-variflight
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: variflight
+        transport: stdio
+        command: !!js process.execPath
+        args:
+          - !!js process.env.VARIFLIGHT_SERVER_PATH
+        cwd: !!js process.cwd()
+        env:
+          PATH: !!js process.env.PATH
+          VARIFLIGHT_API_KEY: !!js process.env.VARIFLIGHT_API_KEY
+          VARIFLIGHT_API_URL: !!js process.env.VARIFLIGHT_API_URL
+          VARIFLIGHT_MCP_ENTRY: !!js process.env.VARIFLIGHT_MCP_ENTRY
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10

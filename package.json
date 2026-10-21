@@ -1,0 +1,31 @@
+{
+  "name": "my-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal DeepSeek Harness agent with Bocha, Flyworks, and Variflight MCPs",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@10.33.4",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "check": "node scripts/check.mjs",
+    "start": "node scripts/run.mjs",
+    "start:open": "node scripts/run.mjs --open"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@variflight-ai/tripmatch-mcp": "1.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@deepseek-ai/dsh-subprocess-local",
+      "@google/genai",
+      "koffi",
+      "node-pty",
+      "protobufjs"
+    ]
+  }
+}

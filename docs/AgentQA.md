@@ -6,6 +6,7 @@
 
 - [意图识别与 Agent loop 是什么？](#意图识别与-agent-loop-是什么)
 - [Agent 意图路由应该怎么设计？](#agent-意图路由应该怎么设计)
+- [结构化能力路由器和受限 Agent loop 具体怎么设计？](#结构化能力路由器和受限-agent-loop-具体怎么设计)
 - [Agent 评测集应该怎么设计？](#agent-评测集应该怎么设计)
 - [Checkpoint 是什么？上下文怎么优化？](#checkpoint-是什么上下文怎么优化)
 - [FastAPI 中能否用 Middleware 统一做 Agent 准入检查？](#fastapi-中能否用-middleware-统一做-agent-准入检查)
@@ -158,12 +159,61 @@ flowchart TD
 以下判断不应依赖大模型自由发挥：
 
 - 权限、安全和内容合规检查。
-- 显式命令，例如用户明确指定“用 Bocha 搜索”。
+- 机器可读的路由信号，例如按钮、API 字段或固定命令。
 - MCP 是否启用、API Key 是否配置、服务是否健康。
 - 高风险操作是否需要用户确认。
 - 输入长度、文件类型和参数范围限制。
 
 模型负责语义判断，程序负责不可违反的约束。
+
+这里需要区分“对人明确”和“对程序明确”：
+
+| 输入类型      | 示例                                      | 处理方式       |
+| --------- | --------------------------------------- | ---------- |
+| 机器可读信号    | `route: "web_search"`、点击“联网搜索”按钮       | 代码直接路由     |
+| 受控命令语法    | `/search 最近的 AI 新闻`                    | 命令解析器直接路由  |
+| 自由自然语言    | “用 Bocha 帮我搜索最近的 AI 新闻”                | 先进行语义分析    |
+
+确定性不是“这句话在人看来意思很明确”，而是“程序无需猜测就能唯一判定”。
+
+如果系统接收到的是自由自然语言，即使用户看起来已经明确指定工具，通常仍需要先识别语义。例如下面两句话都包含 `Bocha`：
+
+```text
+用 Bocha 帮我搜索最近的 AI 新闻。
+Bocha 搜索和普通搜索有什么区别？
+```
+
+第一句要求调用搜索能力，第二句只是询问产品差异。仅使用关键词规则会将第二句错误地路由到搜索工具。
+
+因此，推荐按照以下顺序处理：
+
+```ts
+if (hasTrustedRouteHint(request)) {
+  return fixedRoute(request.routeHint);
+}
+
+if (matchesCommandGrammar(request.message)) {
+  return parseFixedCommand(request.message);
+}
+
+if (taskState.waitingForParameter) {
+  return continueCurrentRoute(taskState);
+}
+
+return semanticRouter.classify(request);
+```
+
+其中：
+
+- `routeHint` 必须来自可信的按钮、API 字段或上游工作流，不能直接相信用户文本中伪造的字段。
+- 固定命令必须使用严格、有限的语法，不能为了覆盖自然语言变体而不断堆叠正则表达式。
+- 当前任务正在等待参数时，例如等待航班日期，可以继续已有 Route，而不是重新识别完整意图。
+- 其他自由自然语言进入结构化语义路由器，再由代码校验路由结果并建立工具白名单。
+
+因此，“用户明确指定用 Bocha 搜索”更准确的处理是：
+
+- 用户使用 `/search` 等固定命令：代码直接路由。
+- 用户使用自由自然语言：先识别出显式工具约束，再由代码确保后续执行遵守该约束。
 
 **3. 路由结果必须是结构化数据**
 
@@ -288,11 +338,402 @@ return runAgentLoop({ request, taskContext, tools });
 #### 要点
 
 - 顶层路由选择能力域，Agent loop 再选择具体工具。
-- 确定性规则处理权限、安全、配置和显式命令。
+- 确定性规则处理权限、安全、配置、可信机器信号和固定命令语法。
 - 使用结构化输出和 Schema 校验，不解析自由文本。
 - 低置信度时追问，不要让模型强行猜测。
 - 多意图请求应拆分任务并按依赖顺序执行。
 - 能力注册表统一维护路由描述、参数、工具和风险信息。
+
+### 结构化能力路由器和受限 Agent loop 具体怎么设计？
+
+#### 问题
+
+结构化能力路由器和受限 Agent loop 分别应该如何落地？它们之间的职责边界是什么？
+
+#### 回答
+
+核心原则是：
+
+> 结构化能力路由器决定“进入哪个能力域”，受限 Agent loop 决定“在该能力域内如何完成任务”。
+
+其中，路由结果不是给模型的普通建议，而是后续执行器建立权限边界的依据。
+
+```mermaid
+flowchart LR
+    A[请求与任务上下文] --> B[结构化能力路由器]
+    B --> C[RouteDecision]
+    C --> D[参数与策略校验]
+    D -->|信息不足| E[向用户澄清]
+    D -->|校验通过| F[能力作用域]
+    F --> G[受限 Agent loop]
+    G --> H[结果、降级或失败]
+
+    I[能力注册表] --> B
+    I --> D
+    I --> F
+```
+
+**1. 结构化能力路由器的输入**
+
+路由器不应只读取用户最后一句，而应读取经过裁剪的任务上下文：
+
+```ts
+type RouterInput = {
+  userMessage: string;
+  taskSummary?: string;
+  collectedParameters: Record<string, unknown>;
+  enabledCapabilities: Capability[];
+};
+```
+
+例如下面的连续对话：
+
+```text
+用户：帮我查北京到上海的航班。
+Agent：哪一天？
+用户：下周五。
+```
+
+最后一句“下周五”本身无法完成路由。路由器还需要读取任务摘要和已经收集的出发地、目的地等参数。
+
+**2. 能力注册表是单一事实来源**
+
+每个能力维护统一的描述、参数、工具和风险信息：
+
+```ts
+type Capability = {
+  id: 'direct_answer' | 'web_search' | 'travel_search' | 'avatar_video';
+  description: string;
+  requiredParameters: string[];
+  toolNames: string[];
+  enabled: boolean;
+  riskLevel: 'low' | 'medium' | 'high';
+};
+```
+
+例如：
+
+```ts
+const travelSearch: Capability = {
+  id: 'travel_search',
+  description: '查询航班、火车等出行信息',
+  requiredParameters: ['origin', 'destination', 'date'],
+  toolNames: [
+    'variflight.searchFlights',
+    'variflight.getFlightStatus',
+  ],
+  enabled: true,
+  riskLevel: 'low',
+};
+```
+
+路由 Prompt、参数校验、可用工具和监控标签都应从注册表生成，避免在多处重复维护。
+
+**3. 路由器必须输出结构化决策**
+
+无论底层使用普通 LLM、Jev 还是分类模型，都应转换为统一的 `RouteDecision`：
+
+```ts
+type RouteDecision = {
+  route:
+    | Capability['id']
+    | 'clarify'
+    | 'unsupported';
+  confidence: number;
+  parameters: Record<string, unknown>;
+  missingParameters: string[];
+  needsClarification: boolean;
+  intents: Array<{
+    route: Capability['id'];
+    dependsOn?: number[];
+  }>;
+};
+```
+
+例如：
+
+```json
+{
+  "route": "travel_search",
+  "confidence": 0.94,
+  "parameters": {
+    "origin": "北京",
+    "destination": "上海",
+    "date": "2026-10-30"
+  },
+  "missingParameters": [],
+  "needsClarification": false,
+  "intents": []
+}
+```
+
+`confidence` 只是辅助决策信号，不能视为经过校准的真实概率。路由结果还必须经过以下程序校验：
+
+- JSON Schema、Zod 或 Pydantic 校验。
+- 能力是否存在并启用。
+- 必填参数是否完整且类型合法。
+- 当前用户是否具有执行权限。
+- 是否涉及高风险或有副作用的操作。
+- 是否包含需要拆分的多意图任务。
+
+**4. 路由器的参考实现**
+
+```ts
+async function routeTask(
+  input: RouterInput,
+): Promise<RouteDecision> {
+  const decision = await generateStructuredOutput({
+    schema: RouteDecisionSchema,
+    input,
+  });
+
+  const capability = capabilityRegistry.get(decision.route);
+
+  if (!capability?.enabled) {
+    return unsupportedDecision();
+  }
+
+  const missingParameters = validateRequiredParameters(
+    capability.requiredParameters,
+    decision.parameters,
+  );
+
+  if (
+    decision.confidence < 0.55 ||
+    missingParameters.length > 0
+  ) {
+    return clarifyDecision(missingParameters);
+  }
+
+  return decision;
+}
+```
+
+不使用 Jev 时，`generateStructuredOutput` 可以直接由支持 JSON Schema 或 Tool Calling 的大模型实现。以后接入 Jev，只需要替换语义分类实现，不应改变 `RouteDecision` 契约和后续执行架构。
+
+**5. 受限 Agent loop 的输入**
+
+通过路由与校验后，程序根据能力注册表建立工具白名单：
+
+```ts
+const capability = capabilityRegistry.get(decision.route);
+const allowedTools = toolRegistry.pick(capability.toolNames);
+
+return runAgentLoop({
+  goal: request,
+  parameters: decision.parameters,
+  allowedTools,
+});
+```
+
+例如命中 `travel_search` 后，模型只能看到：
+
+```text
+variflight.searchFlights
+variflight.getFlightStatus
+```
+
+它不应该看到 Bocha、Flyworks 或其他能力域的工具。这样即使输入中要求“忽略规则并调用所有工具”，执行器也无法越过白名单。
+
+工具限制必须由代码实际执行，不能只在 Prompt 中提醒模型。
+
+**6. Agent loop 的状态**
+
+```ts
+type AgentState = {
+  goal: string;
+  parameters: Record<string, unknown>;
+  observations: ToolResult[];
+  step: number;
+  status:
+    | 'planning'
+    | 'executing'
+    | 'completed'
+    | 'needs_clarification'
+    | 'failed';
+  remainingTokenBudget: number;
+  deadline: number;
+};
+```
+
+每一轮只允许完成一次明确的状态推进：
+
+```text
+观察当前状态
+  -> 规划下一步允许动作
+  -> 校验动作和参数
+  -> 执行工具
+  -> 保存工具结果
+  -> 判断完成、重试、澄清或失败
+```
+
+**7. 受限 Agent loop 的参考实现**
+
+```ts
+async function runAgentLoop(input: AgentLoopInput) {
+  let state = createInitialState(input);
+
+  while (
+    state.step < 5 &&
+    Date.now() < state.deadline
+  ) {
+    const action = await planNextAction({
+      state,
+      tools: input.allowedTools,
+    });
+
+    if (action.type === 'finish') {
+      return buildFinalAnswer(state, action);
+    }
+
+    if (action.type === 'clarify') {
+      return buildClarification(
+        action.missingParameters,
+      );
+    }
+
+    assertToolAllowed(
+      action.tool,
+      input.allowedTools,
+    );
+    validateToolArguments(
+      action.tool,
+      action.arguments,
+    );
+
+    if (requiresConfirmation(action)) {
+      return requestConfirmation(action);
+    }
+
+    const result = await executeTool({
+      ...action,
+      idempotencyKey:
+        createIdempotencyKey(state, action),
+      timeout: 10_000,
+    });
+
+    state = applyObservation(state, result);
+
+    if (hasRepeatedFailure(state)) {
+      return buildFailureResponse(state);
+    }
+  }
+
+  return buildBudgetExceededResponse(state);
+}
+```
+
+**8. “受限”具体限制什么**
+
+| 限制       | 作用                     |
+| -------- | ---------------------- |
+| 工具白名单    | 只能调用当前能力域的工具           |
+| 参数 Schema | 禁止模型随意构造字段和参数类型        |
+| 最大轮数     | 防止无限循环                 |
+| 超时与 Token 预算 | 控制延迟和成本                |
+| 副作用确认    | 付费、外发、删除等操作需要用户确认      |
+| 重试策略     | 仅对超时等可恢复错误进行有限重试       |
+
+生产环境还应增加：
+
+- `Checkpoint`：每轮保存状态，支持中断恢复。
+- `Trace ID`：串联路由、模型推理和工具调用。
+- `Idempotency Key`：避免重试造成重复下单或重复生成。
+- 连续失败检测：相同错误不能被无意义地反复调用。
+- 事实约束：最终回答只能使用真实工具结果，不得补造数据。
+
+**9. 一次完整执行示例**
+
+用户请求：
+
+> 帮我查 10 月 30 日北京到上海的航班。
+
+完整链路为：
+
+```text
+1. 确定性前置规则
+   检查权限、Variflight 配置和服务状态
+
+2. 结构化能力路由
+   route = travel_search
+   parameters = 北京、上海、2026-10-30
+
+3. 参数与策略校验
+   必填参数完整，能力可用
+
+4. 建立能力作用域
+   只加载 Variflight 相关工具
+
+5. 受限 Agent loop
+   规划查询 -> 调用工具 -> 读取结果 -> 判断是否充分
+
+6. 退出
+   将真实航班结果整理后返回
+```
+
+如果用户只说“帮我查航班”，路由器仍可识别为 `travel_search`，但应返回：
+
+```json
+{
+  "route": "travel_search",
+  "missingParameters": [
+    "origin",
+    "destination",
+    "date"
+  ],
+  "needsClarification": true
+}
+```
+
+此时不启动 Agent loop，而是直接向用户追问。
+
+**10. 多意图任务如何处理**
+
+例如：
+
+> 搜索杭州旅游攻略，然后生成一段数字人口播视频。
+
+路由器不应在 `web_search` 和 `avatar_video` 中二选一，而应生成两个有依赖关系的子任务：
+
+```text
+任务 1：web_search
+  输出：旅游攻略和口播稿
+
+任务 2：avatar_video
+  依赖：任务 1
+  输入：任务 1 生成的口播稿
+```
+
+每个子任务分别建立自己的工具白名单并运行受限 loop。顶层任务编排器只负责依赖、状态和结果汇总，不应把两个能力域的全部工具一次性暴露给同一个 loop。
+
+**11. 当前项目的 MVP 建议**
+
+第一版可以先实现三个中心模块：
+
+```text
+CapabilityRegistry
+  管理能力、参数、工具和风险等级
+
+StructuredRouter
+  生成并校验 RouteDecision
+
+BoundedAgentExecutor
+  根据 RouteDecision 建立工具白名单并执行 loop
+```
+
+其中最关键的工程约束是：
+
+> 路由器输出的 `route` 必须真正转化为执行器的工具白名单，而不能只写进 Prompt 提醒模型。
+
+#### 要点
+
+- 路由器选择能力域，不直接决定每一个具体工具调用。
+- `RouteDecision` 是结构化决策边界，必须经过 Schema 和策略校验。
+- 能力注册表统一维护路由描述、必填参数、工具白名单和风险等级。
+- Agent loop 只接收命中能力的工具，不应看到系统全部工具。
+- 最大轮数、超时、预算、确认、重试和幂等都由代码控制。
+- 多意图任务先拆分，再为每个子任务分别建立受限能力作用域。
+- Jev、普通 LLM 或分类器只是可替换的路由实现，不改变整体契约。
 
 ### Agent 评测集应该怎么设计？
 
@@ -993,11 +1434,11 @@ flowchart TB
 
 **1. 常见的三层路由**
 
-| 路由层级 | 选择对象 | 示例 |
-| --- | --- | --- |
-| Agent 路由 | 专业 Agent | 搜索 Agent、视频 Agent、出行 Agent |
-| 能力路由 | 能力域 | `web_search`、`avatar_video`、`travel_search` |
-| 工具路由 | 具体工具 | `create_avatar`、`get_task_status` |
+| 路由层级     | 选择对象     | 示例                                          |
+| -------- | -------- | ------------------------------------------- |
+| Agent 路由 | 专业 Agent | 搜索 Agent、视频 Agent、出行 Agent                  |
+| 能力路由     | 能力域      | `web_search`、`avatar_video`、`travel_search` |
+| 工具路由     | 具体工具     | `create_avatar`、`get_task_status`           |
 
 单 Agent 系统通常只需要后两层。多 Agent 系统会先做 Agent 路由，然后每个专业 Agent 内部仍可能继续做能力和工具路由。
 
@@ -1119,11 +1560,11 @@ Supervisor 不应该亲自完成所有专业任务，否则只是给单 Agent �
 
 常见实现有三种：
 
-| 方式 | 实现 | 特点 |
-| --- | --- | --- |
-| 确定性编排 | 状态机、规则和工作流代码 | 稳定，但难处理开放语义 |
+| 方式             | 实现              | 特点          |
+| -------------- | --------------- | ----------- |
+| 确定性编排          | 状态机、规则和工作流代码    | 稳定，但难处理开放语义 |
 | LLM Supervisor | 模型动态分解和选择 Agent | 灵活，但不易约束和评测 |
-| 混合模式 | 代码控制流程，模型处理语义判断 | 通常最适合生产系统 |
+| 混合模式           | 代码控制流程，模型处理语义判断 | 通常最适合生产系统   |
 
 推荐混合模式：
 
@@ -1416,14 +1857,14 @@ class VideoAgent:
 
 **10. 失败应该由谁处理**
 
-| 失败类型 | 处理者 |
-| --- | --- |
-| MCP 短暂超时 | 专业 Agent 在上限内重试 |
-| 参数缺失 | Supervisor 向用户澄清 |
-| Agent 返回格式错误 | Supervisor 拒绝结果并有限重试 |
-| 能力不可用 | Supervisor 选择降级能力或失败 |
-| 高风险操作 | Tool Policy Gate 暂停并请求确认 |
-| 子任务永久失败 | Supervisor 取消依赖任务并汇总原因 |
+| 失败类型         | 处理者                      |
+| ------------ | ------------------------ |
+| MCP 短暂超时     | 专业 Agent 在上限内重试          |
+| 参数缺失         | Supervisor 向用户澄清         |
+| Agent 返回格式错误 | Supervisor 拒绝结果并有限重试     |
+| 能力不可用        | Supervisor 选择降级能力或失败     |
+| 高风险操作        | Tool Policy Gate 暂停并请求确认 |
+| 子任务永久失败      | Supervisor 取消依赖任务并汇总原因   |
 
 失败处理规则应由代码定义，不能完全依赖模型临场判断。
 
@@ -1504,23 +1945,23 @@ stateDiagram-v2
 
 **2. 状态、事件、守卫条件和动作**
 
-| 概念 | 含义 | 示例 |
-| --- | --- | --- |
-| State | 当前生命周期阶段 | `RUNNING`、`WAITING_EXTERNAL` |
-| Event | 触发状态变化的事实 | `tool_succeeded`、`user_replied` |
-| Guard | 是否允许转换的条件 | 已获得审批、重试次数未超限 |
-| Action | 转换时执行的操作 | 保存结果、创建子任务 |
+| 概念         | 含义          | 示例                                  |
+| ---------- | ----------- | ----------------------------------- |
+| State      | 当前生命周期阶段    | `RUNNING`、`WAITING_EXTERNAL`        |
+| Event      | 触发状态变化的事实   | `tool_succeeded`、`user_replied`     |
+| Guard      | 是否允许转换的条件   | 已获得审批、重试次数未超限                       |
+| Action     | 转换时执行的操作    | 保存结果、创建子任务                          |
 | Transition | 从旧状态到新状态的规则 | `WAITING + user_replied -> RUNNING` |
 
 模型可以提出下一步动作，但最终状态转换必须经过程序校验，不能让模型写入任意状态字符串。
 
 **3. 状态机、Agent loop、Checkpoint 和 Supervisor 的关系**
 
-| 概念 | 负责什么 |
-| --- | --- |
-| Agent loop | 反复观察、决策、行动 |
-| 状态机 | 限制每一步允许发生的生命周期变化 |
-| Checkpoint | 持久化当前状态和相关数据 |
+| 概念         | 负责什么                    |
+| ---------- | ----------------------- |
+| Agent loop | 反复观察、决策、行动              |
+| 状态机        | 限制每一步允许发生的生命周期变化        |
+| Checkpoint | 持久化当前状态和相关数据            |
 | Supervisor | 在多任务或多 Agent 场景中驱动全局状态机 |
 
 它们不是互相替代的关系。典型流程是：
@@ -1745,11 +2186,11 @@ async def run_agent(thread_id: str):
 
 这三个概念分别解决不同问题：
 
-| 能力 | 解决的问题 | 典型存储 |
-| --- | --- | --- |
-| 知识图谱 | 实体之间存在什么明确关系 | 图数据库或关系表 |
-| 稠密检索 | 哪些内容在语义上相似 | 向量数据库或向量索引 |
-| 稀疏检索 | 哪些内容包含精确关键词 | 倒排索引 |
+| 能力   | 解决的问题            | 典型存储            |
+| ---- | ---------------- | --------------- |
+| 知识图谱 | 实体之间存在什么明确关系     | 图数据库或关系表        |
+| 稠密检索 | 哪些内容在语义上相似       | 向量数据库或向量索引      |
+| 稀疏检索 | 哪些内容包含精确关键词      | 倒排索引            |
 | 用户记忆 | 哪些偏好和历史事实值得跨任务保留 | Profile、事件库、向量库 |
 
 它们通常组合使用，但不能互相替代。
@@ -1914,20 +2355,20 @@ flowchart TD
     KG --> ENTITY[主数据与实体消歧]
 ```
 
-| 应用场景 | 常见实体和关系 | 知识图谱解决的问题 |
-| --- | --- | --- |
-| 企业知识问答 / GraphRAG | 文档、产品、制度、组织、专家 | 多跳问答、知识关联、来源追溯 |
-| 搜索与知识发现 | 主题、概念、内容、作者 | 关系导航、关联推荐、概念扩展 |
-| 推荐与个性化 | 用户、物品、主题、行为 | 兴趣传播、可解释推荐、冷启动补充 |
-| 用户与客户画像 | 用户、组织、项目、偏好 | 汇总分散身份、关系和历史行为 |
-| 风控与反欺诈 | 账户、设备、交易、地址 | 发现团伙、共享设备和隐蔽资金路径 |
-| 服务依赖与故障定位 | 服务、API、配置、集群、版本 | 根因链路、故障传播和影响面分析 |
-| 数据血缘与治理 | 表、字段、任务、报表、负责人 | 上下游追踪、变更影响、责任定位 |
-| 供应链管理 | 供应商、零件、工厂、订单 | 多级供应关系、断供风险和替代路径 |
-| 医疗与药物研发 | 疾病、基因、药物、靶点、论文 | 关联发现、机制分析和研究证据整合 |
-| 主数据与实体消歧 | 客户、公司、产品、地址、别名 | 合并重复实体，建立统一业务 ID |
-| 权限与合规分析 | 用户、角色、资源、策略 | 权限继承、越权路径和合规追踪 |
-| Agent 能力网络 | Agent、MCP、工具、能力、约束 | 能力发现、工具依赖和影响分析 |
+| 应用场景              | 常见实体和关系            | 知识图谱解决的问题        |
+| ----------------- | ------------------ | ---------------- |
+| 企业知识问答 / GraphRAG | 文档、产品、制度、组织、专家     | 多跳问答、知识关联、来源追溯   |
+| 搜索与知识发现           | 主题、概念、内容、作者        | 关系导航、关联推荐、概念扩展   |
+| 推荐与个性化            | 用户、物品、主题、行为        | 兴趣传播、可解释推荐、冷启动补充 |
+| 用户与客户画像           | 用户、组织、项目、偏好        | 汇总分散身份、关系和历史行为   |
+| 风控与反欺诈            | 账户、设备、交易、地址        | 发现团伙、共享设备和隐蔽资金路径 |
+| 服务依赖与故障定位         | 服务、API、配置、集群、版本    | 根因链路、故障传播和影响面分析  |
+| 数据血缘与治理           | 表、字段、任务、报表、负责人     | 上下游追踪、变更影响、责任定位  |
+| 供应链管理             | 供应商、零件、工厂、订单       | 多级供应关系、断供风险和替代路径 |
+| 医疗与药物研发           | 疾病、基因、药物、靶点、论文     | 关联发现、机制分析和研究证据整合 |
+| 主数据与实体消歧          | 客户、公司、产品、地址、别名     | 合并重复实体，建立统一业务 ID |
+| 权限与合规分析           | 用户、角色、资源、策略        | 权限继承、越权路径和合规追踪   |
+| Agent 能力网络        | Agent、MCP、工具、能力、约束 | 能力发现、工具依赖和影响分析   |
 
 **7. 怎么判断是否真的需要知识图谱**
 
@@ -2020,14 +2461,14 @@ CAPABILITY_REGISTRY = {
 
 区别不在于文件大小，而在于向量中非零值的分布。
 
-| 特征 | 稠密向量 Dense | 稀疏向量 Sparse |
-| --- | --- | --- |
-| 维度 | 通常几百到数千维 | 通常词表级，数万到百万维 |
-| 非零值 | 绝大多数维度有值 | 只有少量维度非零 |
-| 维度含义 | 通常不可直接解释 | 通常对应词或 Token |
-| 主要能力 | 语义相似、同义表达 | 精确关键词、编号、产品名 |
-| 常用索引 | HNSW、IVF | 倒排索引 |
-| 常用评分 | Cosine、Dot Product | BM25、稀疏点积 |
+| 特征   | 稠密向量 Dense         | 稀疏向量 Sparse  |
+| ---- | ------------------ | ------------ |
+| 维度   | 通常几百到数千维           | 通常词表级，数万到百万维 |
+| 非零值  | 绝大多数维度有值           | 只有少量维度非零     |
+| 维度含义 | 通常不可直接解释           | 通常对应词或 Token |
+| 主要能力 | 语义相似、同义表达          | 精确关键词、编号、产品名 |
+| 常用索引 | HNSW、IVF           | 倒排索引         |
+| 常用评分 | Cosine、Dot Product | BM25、稀疏点积    |
 
 稠密向量示例：
 
@@ -2213,13 +2654,13 @@ async def update_user_memory(messages, user_id):
 
 **15. 用户记忆应该分层存储**
 
-| 记忆类型 | 内容 | 推荐存储 |
-| --- | --- | --- |
+| 记忆类型           | 内容         | 推荐存储       |
+| -------------- | ---------- | ---------- |
 | Session / Task | 当前目标、参数、状态 | Checkpoint |
-| Profile | 明确偏好、稳定属性 | 关系库或 KV |
-| Episodic | 历史交互片段 | 事件库 + 向量索引 |
-| Semantic | 归纳后的长期事实 | 结构化表或知识图谱 |
-| Artifact | 文件、视频、报告 | 文件或对象存储 |
+| Profile        | 明确偏好、稳定属性  | 关系库或 KV    |
+| Episodic       | 历史交互片段     | 事件库 + 向量索引 |
+| Semantic       | 归纳后的长期事实   | 结构化表或知识图谱  |
+| Artifact       | 文件、视频、报告   | 文件或对象存储    |
 
 不是所有记忆都应该变成向量，也不是所有偏好都应该写入知识图谱。
 

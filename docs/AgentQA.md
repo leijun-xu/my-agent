@@ -7,6 +7,7 @@
 - [意图识别与 Agent loop 是什么？](#意图识别与-agent-loop-是什么)
 - [Agent 意图路由应该怎么设计？](#agent-意图路由应该怎么设计)
 - [结构化能力路由器和受限 Agent loop 具体怎么设计？](#结构化能力路由器和受限-agent-loop-具体怎么设计)
+- [Agent Harness 是什么？Claude、OpenAI 和 DeepSeek Harness 有什么关系？](#agent-harness-是什么claudeopenai-和-deepseek-harness-有什么关系)
 - [Agent 评测集应该怎么设计？](#agent-评测集应该怎么设计)
 - [Checkpoint 是什么？上下文怎么优化？](#checkpoint-是什么上下文怎么优化)
 - [FastAPI 中能否用 Middleware 统一做 Agent 准入检查？](#fastapi-中能否用-middleware-统一做-agent-准入检查)
@@ -734,6 +735,239 @@ BoundedAgentExecutor
 - 最大轮数、超时、预算、确认、重试和幂等都由代码控制。
 - 多意图任务先拆分，再为每个子任务分别建立受限能力作用域。
 - Jev、普通 LLM 或分类器只是可替换的路由实现，不改变整体契约。
+
+### Agent Harness 是什么？Claude、OpenAI 和 DeepSeek Harness 有什么关系？
+
+#### 问题
+
+为什么现在 Agent 领域开始频繁出现 Harness 架构？Claude 和 OpenAI 都提到 Harness，它是一种怎样的设计思想，有什么先进之处？它和当前项目使用的 DeepSeek Harness 是同一个东西吗？
+
+#### 回答
+
+Harness 不是一种新模型，而是 **Agent 的运行时控制层**。可以简化为：
+
+```text
+Agent = Model + Harness + Environment
+```
+
+- **Model**：理解输入、推理并提出下一步动作。
+- **Harness**：组织 Agent loop，管理上下文、工具、权限、状态、恢复和追踪。
+- **Environment**：文件、Shell、浏览器、MCP、Sandbox、数据库及其他真实资源。
+
+Claude、OpenAI Codex 和 DeepSeek Harness 使用的是同一类设计思想，但不是同一套代码、协议或具体实现。“Harness”目前更接近行业架构概念，而不是一个统一标准。
+
+```mermaid
+flowchart TB
+    UI[用户与客户端<br/>Web / CLI / IDE / API]
+    MODEL[模型<br/>理解、推理、选择动作]
+
+    subgraph HARNESS[Agent Harness]
+        LOOP[Agent loop]
+        CONTEXT[上下文与会话]
+        POLICY[策略与权限]
+        TRACE[事件与追踪]
+    end
+
+    TOOLS[工具与 MCP]
+    RUNTIME[Sandbox 与存储]
+
+    UI <--> HARNESS
+    HARNESS <--> MODEL
+    HARNESS <--> TOOLS
+    HARNESS <--> RUNTIME
+```
+
+**1. 为什么现在开始强调 Harness**
+
+早期 LLM 应用基本是一次请求响应：
+
+```text
+用户输入 -> 模型生成 -> 返回文本
+```
+
+真正的 Agent 则需要持续与环境交互：
+
+```text
+读取环境
+  -> 调用模型
+  -> 校验并执行工具
+  -> 保存执行结果
+  -> 判断任务是否完成
+  -> 组装或压缩上下文
+  -> 进入下一轮
+```
+
+模型本身通常不负责：
+
+- 保存跨请求、跨窗口和跨进程状态。
+- 控制工具权限、参数和副作用。
+- 在进程重启或上下文耗尽后恢复任务。
+- 限制循环次数、Token、超时和费用。
+- 运行 Shell、编辑文件和管理 Sandbox。
+- 记录完整轨迹并支持审计、回放和分叉。
+- 将同一 Agent 同时接入 CLI、IDE、Web 和 API。
+
+随着模型的语义理解和工具选择能力增强，系统瓶颈逐渐从“模型会不会推理”转移到：
+
+> 如何让模型长期、稳定、安全地在真实环境中工作。
+
+因此，原来分散在应用代码中的 Agent loop、上下文管理、工具执行和状态持久化开始被收敛成独立 Harness。
+
+**2. Harness 通常包含哪些能力**
+
+| 模块                 | 职责                         |
+| ------------------ | -------------------------- |
+| Agent loop         | 调用模型、执行动作、观察结果并判断退出        |
+| Context Engine     | 上下文组装、裁剪、摘要、压缩和动态注入        |
+| Session            | 消息、任务状态、Checkpoint、恢复和分叉      |
+| Tool Runtime       | 工具注册、Schema 校验、MCP 和结果标准化      |
+| Policy Gate        | 权限、白名单、审批、预算和风险控制           |
+| Sandbox            | 文件系统、进程、网络和代码执行隔离           |
+| Observability      | 事件日志、Trace、回放、评测和调试          |
+| Client Protocol    | 向 Web、CLI、IDE 等输出统一事件流        |
+
+前面讨论的“结构化能力路由器”“工具白名单”和“受限 Agent loop”，都属于 Harness 内部组件。
+
+**3. Harness 的先进之处**
+
+**模型与执行系统解耦**
+
+```text
+Claude / GPT / DeepSeek
+          ↓
+统一 Harness 接口
+          ↓
+MCP / Shell / Browser / API
+```
+
+模型负责提出动作，Harness 决定动作是否允许、如何执行、结果如何写回以及何时停止。替换模型时，工具和业务系统不必整体重写。
+
+**从对话历史升级为事件状态**
+
+成熟 Harness 不只保存 `messages[]`，还会记录：
+
+```text
+turn/start
+model/request
+tool/call
+tool/result
+approval/request
+checkpoint
+turn/end
+```
+
+事件化状态使恢复、回放、分叉、审计和故障定位成为稳定能力，而不是临时补丁。
+
+**支持长任务连续执行**
+
+长任务可能跨越多个上下文窗口和进程实例。Harness 通过 Session、Checkpoint、上下文压缩、进度工件和任务状态，让新一轮执行能够接续已有工作。
+
+Anthropic 在长任务 Harness 实践中使用初始化 Agent、增量执行 Agent、进度文件、功能清单和 Git 历史，解决 Agent 一次做得过多、上下文耗尽以及过早宣布完成的问题：
+
+- [Anthropic：Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+
+**同一运行核心支持多个产品形态**
+
+OpenAI 将 Codex 的 Agent loop、线程生命周期、持久化、工具执行和配置认证收敛在 Codex Core，并通过 App Server 的双向 JSON-RPC 提供给 CLI、IDE、桌面端和 Web 使用：
+
+- [OpenAI：解锁 Codex 运行框架](https://openai.com/index/unlocking-the-codex-harness/)
+
+这样可以只维护一套 Agent 语义，而不是在每个客户端重新实现 loop 和状态管理。
+
+**可治理而不只是更自主**
+
+Harness 不是为了让模型无限自由，而是将自主性限制在明确边界内：
+
+- 工具白名单。
+- 参数 Schema。
+- 最大轮数和预算。
+- Sandbox。
+- 人工审批。
+- 幂等、重试和超时策略。
+
+因此，Harness 本质上是自主决策与确定性执行之间的控制层。
+
+**4. Claude、OpenAI 和 DeepSeek Harness 的区别**
+
+| 实现                           | 主要设计重点                          |
+| ---------------------------- | ------------------------------- |
+| Claude Agent SDK / Harness 实践 | 上下文管理、工具使用、长任务增量推进和跨窗口交接       |
+| OpenAI Codex Harness         | 统一 Codex Core、线程事件协议和跨客户端复用      |
+| DeepSeek Harness             | Cordis 插件系统、能力可组合、组件可替换和运行轨迹回放 |
+
+它们共享的基本能力包括：
+
+- 模型调用与 Agent loop。
+- 工具和环境交互。
+- Session 与上下文管理。
+- 权限和 Sandbox。
+- 运行事件和可观测性。
+
+但三者的扩展接口、会话模型、事件格式、客户端协议和部署方式不同，不能直接互换。
+
+**5. DeepSeek Harness 的特点**
+
+DeepSeek Harness 的核心设计是：
+
+> Everything is a plugin.
+
+模型适配器、工具、Skills、Session、Sandbox、存储、Agent loop、调度和 UI 都可以由 Cordis 插件提供，并通过 Profile、Bundle 和配置 Patch 组合或替换。
+
+它还将模型可见输入、模型输出、工具调用、工具结果和上下文注入记录到追加式 Session Log 中。恢复、分叉、搜索和回放都基于同一事件流。
+
+官方资料：
+
+- [DeepSeek Harness 官方介绍](https://www.deepseek.com/harness/en/)
+- [DeepSeek Harness 架构文档](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md)
+
+DeepSeek Harness 因此更接近一个开放、可组合的 Agent Runtime，而不是固定用途的单一 Agent。
+
+**6. 它和当前项目是什么关系**
+
+当前项目直接使用 DeepSeek Harness `0.2.1-rc.2` 作为运行时底座：
+
+```text
+当前项目配置与启动层
+        ↓
+DeepSeek Harness
+        ↓
+Cordis 插件与 Agent loop
+        ↓
+Bocha / Flyworks / Variflight MCP
+```
+
+Harness 与这些 MCP 不做源码耦合。项目通过独立 Cordis 配置挂载 MCP，因此可以增加、移除或替换能力，而不修改 Harness 核心源码。
+
+这里需要区分：
+
+- DeepSeek 模型是可以被 Harness 调用的模型之一。
+- DeepSeek Harness 是承载模型、工具、Session 和执行循环的运行时。
+- 当前项目是基于 DeepSeek Harness 组合出的一个具体个人 Agent 产品。
+
+**7. Harness 是否越复杂越先进**
+
+不是。Harness 中往往包含许多用于补偿当前模型缺陷的假设，例如强制拆分步骤、频繁重置上下文或特殊 Prompt。模型升级后，这些机制可能失去价值，甚至限制模型能力。
+
+复杂 Harness 还可能带来：
+
+- 组件和事件过多，调试成本升高。
+- 状态来源不清晰，恢复行为难以预测。
+- 插件依赖复杂，配置组合难以验证。
+- 过度编排，使简单任务承担不必要的延迟和 Token 成本。
+
+更合理的方向是：
+
+> 稳定接口、可替换能力、完整事件记录，以及尽量薄的控制内核。
+
+#### 要点
+
+- Harness 是 Agent 的运行时控制层，不是模型。
+- 它负责 loop、上下文、Session、工具、权限、Sandbox 和运行追踪。
+- Harness 兴起是因为 Agent 的难点已经从单次推理扩展到长期、可靠和安全执行。
+- Claude、OpenAI Codex 和 DeepSeek Harness 属于同一架构类别，但实现和协议不同。
+- DeepSeek Harness 的突出特点是 Cordis 驱动的全面插件化和追加式事件日志。
+- 当前项目使用 DeepSeek Harness 作为底座，再通过 Cordis 配置挂载多个 MCP。
+- Harness 不是越复杂越好，应避免用固定编排过度限制模型。
 
 ### Agent 评测集应该怎么设计？
 
